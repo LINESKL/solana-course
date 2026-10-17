@@ -1,0 +1,22 @@
+[package]
+name = "greeter"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "3"
+
+[dev-dependencies]
+litesvm = "0.17.0"
+solana-keypair = "3"
+solana-signer = "3"
+solana-transaction = "4"
+solana-message = "4"
+solana-instruction = "3.5"
+solana-account = "4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("custom-heap", "custom-panic"))'] }
