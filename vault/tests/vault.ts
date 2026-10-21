@@ -8,8 +8,16 @@
  */
 
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { createMint } from "@solana/spl-token";
+import { Program, BN } from "@coral-xyz/anchor";
+import {
+  createMint,
+  getAccount,
+  getAssociatedTokenAddressSync,
+  getMint,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
+  transfer,
+} from "@solana/spl-token";
 import {
   Keypair,
   PublicKey,
@@ -213,5 +221,99 @@ describe("simple_vault", () => {
     await createCard(userB);
     const card = await program.account.userCard.fetch(cardPda(userB.publicKey));
     assert.equal(card.owner.toBase58(), userB.publicKey.toBase58());
+  });
+
+  // ── Неделя 9: депозит и share-токены ─────────────────────────────────────
+
+  const UNIT = 1_000_000; // 6 знаков после запятой
+  const tokens = (n: number) => new BN(n * UNIT);
+
+  // токен-аккаунт пользователя с тестовыми токенами vault
+  const fundTokens = async (user: PublicKey, amount: number) => {
+    const ata = await getOrCreateAssociatedTokenAccount(provider.connection, admin, tokenMint, user);
+    await mintTo(provider.connection, admin, tokenMint, ata.address, admin, amount * UNIT);
+    return ata.address;
+  };
+
+  const deposit = (user: Keypair, amount: BN, userTokenAccount = getAssociatedTokenAddressSync(tokenMint, user.publicKey)) =>
+    program.methods
+      .deposit(amount)
+      .accounts({
+        vaultState: vaultStatePDA,
+        userCard: cardPda(user.publicKey),
+        tokenMint,
+        vaultTokenAccount: vaultTokenAccountPDA,
+        shareMint: shareMintPDA,
+        userTokenAccount,
+        user: user.publicKey,
+      } as any)
+      .signers([user])
+      .rpc();
+
+  const shareBalance = async (user: PublicKey) =>
+    Number((await getAccount(provider.connection, getAssociatedTokenAddressSync(shareMintPDA, user))).amount) / UNIT;
+  const vaultBalance = async () => Number((await getAccount(provider.connection, vaultTokenAccountPDA)).amount) / UNIT;
+
+  it("первый вкладчик получает share-токены 1:1", async () => {
+    await fundTokens(userA.publicKey, 5_000);
+    await deposit(userA, tokens(1_000));
+
+    assert.equal(await shareBalance(userA.publicKey), 1_000);
+    assert.equal(await vaultBalance(), 1_000);
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    assert.equal(card.deposited.toNumber(), 1_000 * UNIT);
+    const vault = await program.account.vaultState.fetch(vaultStatePDA);
+    assert.equal(vault.totalDeposited.toNumber(), 1_000 * UNIT);
+  });
+
+  it("после дохода vault поздний вкладчик получает долю по курсу (пример из методички)", async () => {
+    // vault «заработал» 100 токенов: кладём их в хранилище напрямую, share-токены при этом не выпускаются
+    const adminAta = await fundTokens(admin.publicKey, 100);
+    await transfer(provider.connection, admin, adminAta, vaultTokenAccountPDA, admin, 100 * UNIT);
+    assert.equal(await vaultBalance(), 1_100);
+
+    await fundTokens(userB.publicKey, 1_000);
+    await deposit(userB, tokens(110));
+
+    // 110 / 1100 × 1000 = 100 share-токенов — меньше, чем внёс
+    assert.equal(await shareBalance(userB.publicKey), 100);
+    assert.equal(await vaultBalance(), 1_210);
+    const supply = Number((await getMint(provider.connection, shareMintPDA)).supply) / UNIT;
+    assert.equal(supply, 1_100);
+  });
+
+  it("повторный депозит добавляется к карточке", async () => {
+    await deposit(userA, tokens(11));
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    assert.equal(card.deposited.toNumber(), 1_011 * UNIT);
+    // 11 / 1210 × 1100 = 10 share-токенов
+    assert.equal(await shareBalance(userA.publicKey), 1_010);
+  });
+
+  it("депозит нуля запрещён", async () => {
+    await expectError(deposit(userA, new BN(0)), "ZeroAmount");
+  });
+
+  it("слишком маленький депозит, за который положено 0 share-токенов, запрещён", async () => {
+    // 1 минимальная единица × 1100 / 1210 = 0 после округления вниз
+    await expectError(deposit(userA, new BN(1)), "ZeroShares");
+  });
+
+  it("без карточки депозит невозможен", async () => {
+    const stranger = Keypair.generate();
+    await fundFromAdmin(provider, admin, stranger.publicKey);
+    await fundTokens(stranger.publicKey, 10);
+    await expectError(deposit(stranger, tokens(1)), "AccountNotInitialized");
+  });
+
+  it("нельзя внести токены с чужого токен-аккаунта", async () => {
+    const othersAccount = getAssociatedTokenAddressSync(tokenMint, userA.publicKey);
+    await expectError(deposit(userB, tokens(1), othersAccount), "ConstraintTokenOwner");
+  });
+
+  it("на паузе депозит запрещён", async () => {
+    await setPaused(true);
+    await expectError(deposit(userA, tokens(1)), "VaultPaused");
+    await setPaused(false);
   });
 });

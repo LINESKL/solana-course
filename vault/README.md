@@ -9,6 +9,7 @@ share-токены — квитанцию о своей доле. Основа �
 | Неделя | Что сделано |
 |---|---|
 | 8 | Каркас: vault, share-токен, хранилище, карточка пользователя. Пауза vault, закрытие карточки, время создания |
+| 9 | Депозит: перевод токенов в хранилище, выпуск share-токенов по курсу, учёт в vault и карточке |
 
 ---
 
@@ -53,7 +54,7 @@ flowchart TD
 | `close_user_card` | владелец карточки | закрывает карточку, рента возвращается владельцу |
 | `set_paused(bool)` | только админ (`has_one = admin`) | ставит vault на паузу или снимает с неё |
 
-### Аккаунты в devnet
+### Аккаунты в devnet (vault недели 8)
 
 | Что | Ссылка |
 |---|---|
@@ -66,7 +67,7 @@ flowchart TD
 | Транзакция `initialize_vault` | [5tAw…LnNCb](https://explorer.solana.com/tx/5tAwCt8Wn7PXpovLeRLab9Km1PxR97qpSeiLSi8fDnnAhbkVMVRsQDomo6mzycN3PVHExe6FXpkYt2CaqqKLnNCb?cluster=devnet) |
 | Транзакция `create_user_card` | [vEbr…5CNg](https://explorer.solana.com/tx/vEbrAmQUcDpywEAJDS7qW1GSobdeHRkdQNac36oRm9a9nmpLbCWRDNhD68cSEXhoSXH77i3qdgrDuYfvPae5CNg?cluster=devnet) |
 
-Все адреса сохранены в [`devnet.json`](devnet.json).
+Это vault из недели 8 (старая структура данных). Актуальный vault — в разделе недели 9 и в [`devnet.json`](devnet.json).
 
 ### Проверьте себя
 
@@ -78,6 +79,62 @@ flowchart TD
   приватного ключа, поэтому подписать за него может только программа (через `invoke_signed`).
 - **Как найти карточку конкретного пользователя?** Вычислить адрес из seeds
   `["user_card", vault_state, user]` — хранить список пользователей не нужно.
+
+---
+
+## Неделя 9 — депозит и share-токены
+
+`deposit(amount)` — пользователь вносит токены и получает share-токены (свою долю):
+
+1. **считает долю:** первый вкладчик получает share-токены 1:1, дальше
+   `shares = amount × всего_shares / всего_токенов_в_vault` (в u128, округление вниз — в пользу vault);
+2. **переводит токены пользователя в хранилище** — CPI `transfer_checked` в Token Program, подписывает сам пользователь;
+3. **выпускает share-токены** — CPI `mint_to`, подписывает программа от имени VaultState (PDA, `invoke_signed` с seeds `["vault", token_mint, bump]`);
+4. **обновляет учёт:** `VaultState.total_deposited` и `UserCard.deposited`.
+
+Ограничения: сумма > 0 (`ZeroAmount`), за депозит должно быть положено хотя бы 1 share (`ZeroShares`),
+нужна своя карточка, токены только со своего токен-аккаунта, на паузе депозит запрещён.
+Токен-аккаунт для share-токенов создаётся автоматически при первом депозите (`init_if_needed`).
+
+**Пример из методички проверен тестом:** в vault 1000 токенов и 1000 shares, vault заработал +100
+(стало 1100), новый пользователь вносит 110 → получает 100 shares (110 / 1100 × 1000).
+
+### Депозит в devnet
+
+После обновления программы структура `VaultState` изменилась (добавлено `total_deposited`), поэтому
+для недели 9 создан новый vault (адреса в [`devnet.json`](devnet.json)):
+
+| Что | Ссылка |
+|---|---|
+| VaultState | [3xsM…mmb6](https://explorer.solana.com/address/3xsMsffXc69QVhNxhv5g7YFBPXpTFj6cApaty12vmmb6?cluster=devnet) |
+| Токен vault | [Fmke…gUBx](https://explorer.solana.com/address/Fmke9hR8YLR127as4pPpPx4DLQgt1Pjh5rAqTWHzgUBx?cluster=devnet) |
+| Хранилище | [61ti…bRrh](https://explorer.solana.com/address/61tivhpQ89oxZodpQMo2XN7mXCQ7bcGxWEAFeTyebRrh?cluster=devnet) |
+| Share mint | [G24j…qRNU](https://explorer.solana.com/address/G24jyuWdDXv51veZJTzut3WSajCaVrpme98DCUWuqRNU?cluster=devnet) |
+| **Транзакция депозита 1000 токенов** | [9ffV…bXmu](https://explorer.solana.com/tx/9ffVkDtu1nNerFJk4iMnG591ZhY9ryoXtoVpKWZ4HgHkghNYR3t6ParsRnesKvLRK3jxSMUzCAoF4vPurPebXmu?cluster=devnet) |
+
+Что внутри транзакции депозита (вызовы между программами):
+
+```
+simple_vault · Deposit
+├─ Associated Token Program · create          — токен-аккаунт для share-токенов (первый депозит)
+│  ├─ Token Program · getAccountDataSize
+│  ├─ System Program · createAccount
+│  ├─ Token Program · initializeImmutableOwner
+│  └─ Token Program · initializeAccount3
+├─ Token Program · transferChecked  1000 → хранилище vault   (подпись пользователя)
+└─ Token Program · mintTo           1000 shares → пользователю (подпись vault PDA)
+```
+
+### Проверьте себя
+
+- **Почему поздний вкладчик может получить share-токенов меньше, чем внёс токенов?** Share — это доля.
+  Если vault заработал, на каждый share приходится больше токенов, и share «стоит» дороже. Иначе
+  новичок забрал бы часть дохода тех, кто вложился раньше.
+- **Почему перевод подписывает пользователь, а выпуск share-токенов — программа?** Переводятся токены
+  пользователя — разрешить это может только он. А mint authority share-токена — PDA vault, у неё нет
+  ключа, поэтому подписывает программа через seeds.
+- **Какие программы участвовали в транзакции?** simple_vault, Token Program, Associated Token Program,
+  System Program (см. дерево выше).
 
 ---
 
@@ -101,6 +158,8 @@ anchor deploy --provider.cluster devnet
 # vault в devnet из терминала
 node scripts/devnet.mts init    # тестовый токен + vault
 node scripts/devnet.mts card    # своя карточка
+node scripts/devnet.mts mint 5000      # начислить себе тестовые токены
+node scripts/devnet.mts deposit 1000   # депозит
 node scripts/devnet.mts show    # состояние и ссылки на Explorer
 ```
 

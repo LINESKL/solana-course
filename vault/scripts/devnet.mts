@@ -1,14 +1,25 @@
 // Работа с vault в devnet из терминала.
 //   node scripts/devnet.mts init   — создать тестовый токен и vault для него
 //   node scripts/devnet.mts card   — создать свою карточку пользователя
+//   node scripts/devnet.mts mint 1000     — начислить себе тестовые токены vault (мы — mint authority)
+//   node scripts/devnet.mts deposit 100   — внести токены и получить share-токены
 //   node scripts/devnet.mts show   — показать состояние vault и ссылки на Explorer
 // Адреса созданных аккаунтов сохраняются в devnet.json.
 import anchor from "@coral-xyz/anchor";
-import { createMint } from "@solana/spl-token";
+import { createMint, getAccount, getAssociatedTokenAddressSync, getMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 
-const { web3 } = anchor;
+const { web3, BN } = anchor;
+const UNIT = 1_000_000; // 6 знаков после запятой
+
+/** "100.5" -> 100500000 без float */
+function toUnits(amount: string | undefined): InstanceType<typeof BN> {
+  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(amount ?? "");
+  if (!match) throw new Error(`укажите сумму, например 100 или 0.5 (получено "${amount}")`);
+  return new BN(match[1]).mul(new BN(UNIT)).add(new BN((match[2] ?? "").padEnd(6, "0")));
+}
+const fromUnits = (units: bigint | number) => (Number(units) / UNIT).toString();
 const { PublicKey, Keypair, Connection } = web3;
 
 const STATE_FILE = new URL("../devnet.json", import.meta.url);
@@ -84,6 +95,37 @@ async function card() {
   await show();
 }
 
+async function mint() {
+  const state = load();
+  requireVault(state);
+  const tokenMint = new PublicKey(state.tokenMint);
+  const ata = await getOrCreateAssociatedTokenAccount(connection, payer, tokenMint, payer.publicKey);
+  const sig = await mintTo(connection, payer, tokenMint, ata.address, payer, BigInt(toUnits(process.argv[3]).toString()));
+  console.log(`mint ${process.argv[3]}:`, explorer("tx", sig));
+  await show();
+}
+
+async function deposit() {
+  const state = load();
+  const accounts = requireVault(state);
+  const tokenMint = new PublicKey(state.tokenMint);
+  const sig = await program.methods
+    .deposit(toUnits(process.argv[3]))
+    .accounts({
+      vaultState: accounts.vaultState,
+      userCard: accounts.userCard(payer.publicKey),
+      tokenMint,
+      vaultTokenAccount: accounts.vaultTokenAccount,
+      shareMint: accounts.shareMint,
+      userTokenAccount: getAssociatedTokenAddressSync(tokenMint, payer.publicKey),
+      user: payer.publicKey,
+    })
+    .rpc();
+  save({ ...state, depositTx: sig });
+  console.log(`deposit ${process.argv[3]}:`, explorer("tx", sig));
+  await show();
+}
+
 async function show() {
   const state = load();
   const accounts = requireVault(state);
@@ -95,21 +137,28 @@ async function show() {
   console.log("Token mint         ", explorer("address", state.tokenMint));
   console.log("Хранилище (PDA)    ", explorer("address", accounts.vaultTokenAccount.toBase58()));
   console.log("Share mint (PDA)   ", explorer("address", accounts.shareMint.toBase58()));
+  const vaultBalance = (await getAccount(connection, accounts.vaultTokenAccount)).amount;
+  const shareSupply = (await getMint(connection, accounts.shareMint)).supply;
+  console.log("  в vault токенов  ", fromUnits(vaultBalance), " | выпущено shares", fromUnits(shareSupply));
+  console.log("  total_deposited  ", fromUnits(vault.totalDeposited.toNumber()));
   const userCard = accounts.userCard(payer.publicKey);
   const cardData = await program.account.userCard.fetchNullable(userCard);
   if (cardData) {
     console.log("Карточка (PDA)     ", explorer("address", userCard.toBase58()));
     console.log("  owner            ", cardData.owner.toBase58());
     console.log("  created_at       ", new Date(cardData.createdAt.toNumber() * 1000).toISOString());
+    console.log("  deposited        ", fromUnits(cardData.deposited.toNumber()));
+    const myShares = await getAccount(connection, getAssociatedTokenAddressSync(accounts.shareMint, payer.publicKey)).catch(() => null);
+    console.log("  мои shares       ", myShares ? fromUnits(myShares.amount) : "0");
   } else {
     console.log("Карточки пока нет: node scripts/devnet.mts card");
   }
 }
 
-const commands: Record<string, () => Promise<void>> = { init, card, show };
+const commands: Record<string, () => Promise<void>> = { init, card, mint, deposit, show };
 const command = commands[process.argv[2] ?? "show"];
 if (!command) {
-  console.error("usage: node scripts/devnet.mts <init|card|show>");
+  console.error("usage: node scripts/devnet.mts <init|card|mint N|deposit N|show>");
   process.exit(1);
 }
 await command();

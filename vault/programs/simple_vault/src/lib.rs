@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, TransferChecked};
 
 declare_id!("5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp");
 
@@ -43,6 +44,64 @@ pub mod simple_vault {
         Ok(())
     }
 
+    /// Внести токены в vault и получить share-токены (свою долю).
+    ///
+    /// Первый вкладчик получает share-токены 1:1. Дальше — пропорционально:
+    /// shares = amount × всего_shares / всего_токенов_в_vault.
+    /// Если vault заработал, токенов в нём больше, чем shares, и поздний вкладчик
+    /// получает меньше share-токенов, чем внёс: чужой доход ему не достаётся.
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.vault_state.paused, VaultError::VaultPaused);
+        require!(amount > 0, VaultError::ZeroAmount);
+
+        let shares = shares_for_deposit(
+            amount,
+            ctx.accounts.share_mint.supply,
+            ctx.accounts.vault_token_account.amount,
+        )?;
+        require!(shares > 0, VaultError::ZeroShares);
+
+        // 1. токены пользователя -> хранилище vault (подписывает сам пользователь)
+        token::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.user_token_account.to_account_info(),
+                    mint: ctx.accounts.token_mint.to_account_info(),
+                    to: ctx.accounts.vault_token_account.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+            ctx.accounts.token_mint.decimals,
+        )?;
+
+        // 2. выпуск share-токенов пользователю (подписывает программа от имени vault PDA)
+        let token_mint = ctx.accounts.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint.as_ref(), &[ctx.accounts.vault_state.bump]]];
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.share_mint.to_account_info(),
+                    to: ctx.accounts.user_share_account.to_account_info(),
+                    authority: ctx.accounts.vault_state.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            shares,
+        )?;
+
+        // 3. учёт: всего внесено в vault и в карточке пользователя
+        let vault = &mut ctx.accounts.vault_state;
+        vault.total_deposited = vault.total_deposited.checked_add(amount).ok_or(VaultError::MathOverflow)?;
+        let card = &mut ctx.accounts.user_card;
+        card.deposited = card.deposited.checked_add(amount).ok_or(VaultError::MathOverflow)?;
+
+        msg!("Deposit: {} tokens -> {} shares", amount, shares);
+        Ok(())
+    }
+
     /// Поставить vault на паузу или снять с неё. Только админ.
     /// На паузе нельзя создавать новые карточки.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
@@ -50,6 +109,19 @@ pub mod simple_vault {
         msg!("Vault paused: {}", paused);
         Ok(())
     }
+}
+
+/// Сколько share-токенов положено за депозит. Считаем в u128, чтобы
+/// произведение amount × supply не переполнилось; округление вниз — в пользу vault.
+pub fn shares_for_deposit(amount: u64, total_shares: u64, vault_balance: u64) -> Result<u64> {
+    if total_shares == 0 || vault_balance == 0 {
+        return Ok(amount);
+    }
+    let shares = (amount as u128)
+        .checked_mul(total_shares as u128)
+        .ok_or(VaultError::MathOverflow)?
+        / vault_balance as u128;
+    u64::try_from(shares).map_err(|_| error!(VaultError::MathOverflow))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +220,59 @@ pub struct CloseUserCard<'info> {
 }
 
 #[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+        has_one = token_mint,
+        has_one = vault_token_account,
+        has_one = share_mint,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    /// Депозит возможен только с созданной карточкой
+    #[account(
+        mut,
+        seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
+        bump = user_card.bump,
+    )]
+    pub user_card: Account<'info, UserCard>,
+
+    pub token_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub share_mint: Account<'info, Mint>,
+
+    /// Откуда берём токены — только свой токен-аккаунт пользователя
+    #[account(
+        mut,
+        token::mint = token_mint,
+        token::authority = user,
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    /// Куда придут share-токены; создаётся при первом депозите
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = share_mint,
+        associated_token::authority = user,
+    )]
+    pub user_share_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct SetPaused<'info> {
     /// has_one = admin — подписать может только админ, записанный в vault.
     #[account(
@@ -173,11 +298,12 @@ pub struct VaultState {
     pub vault_token_account: Pubkey, // 32 — PDA для токенов
     pub share_mint: Pubkey,          // 32 — mint для shares
     pub bump: u8,                    // 1
-    pub paused: bool,                // 1 — на паузе новые карточки не создаются
+    pub paused: bool,                // 1 — на паузе новые карточки и депозиты запрещены
+    pub total_deposited: u64,        // 8 — сколько всего внесено пользователями
 }
 
 impl VaultState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 1 + 1 + 8;
 }
 
 /// Карточка пользователя в vault.
@@ -188,14 +314,21 @@ pub struct UserCard {
     pub owner: Pubkey,   // 32 — владелец карточки
     pub bump: u8,        // 1
     pub created_at: i64, // 8 — когда создана (unix time)
+    pub deposited: u64,  // 8 — сколько пользователь внёс
 }
 
 impl UserCard {
-    pub const LEN: usize = 8 + 32 + 32 + 1 + 8;
+    pub const LEN: usize = 8 + 32 + 32 + 1 + 8 + 8;
 }
 
 #[error_code]
 pub enum VaultError {
     #[msg("Vault is paused")]
     VaultPaused,
+    #[msg("Amount must be greater than zero")]
+    ZeroAmount,
+    #[msg("Deposit is too small: it would give zero shares")]
+    ZeroShares,
+    #[msg("Math overflow")]
+    MathOverflow,
 }
