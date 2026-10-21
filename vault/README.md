@@ -11,9 +11,10 @@ share-токены — квитанцию о своей доле. Основа �
 | 8 | Каркас: vault, share-токен, хранилище, карточка пользователя. Пауза vault, закрытие карточки, время создания |
 | 9 | Депозит: перевод токенов в хранилище, выпуск share-токенов по курсу, учёт в vault и карточке |
 | 10 | Вывод через CPI: сжигание share-токенов, возврат токенов с подписью vault PDA |
+| 11 | Свой CLMM-пул Raydium в devnet (VLT / tUSD) и позиция в диапазоне ±10% |
 
 Состояние проекта на конец каждой недели — по тегам: [week-08](https://github.com/LINESKL/solana-course/tree/week-08/vault),
-[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault).
+[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault), [week-11](https://github.com/LINESKL/solana-course/tree/week-11/vault).
 
 ---
 
@@ -188,6 +189,79 @@ simple_vault · Withdraw                                  invoke [1]
 - **Почему администратор не может просто забрать токены из vault своей подписью?** Authority хранилища —
   VaultState (PDA), а не админ. Подписать за PDA может только программа, а в программе нет
   инструкции, которая отдала бы токены админу.
+
+---
+
+## Неделя 11 — AMM и концентрированная ликвидность
+
+**AMM** — биржа без книги заявок: в пуле лежат два токена, цену задаёт формула. В простом пуле
+`x × y = k`, и ликвидность «размазана» по всем ценам от 0 до бесконечности. В **CLMM**
+(concentrated liquidity) провайдер выбирает диапазон цен, в котором работают его деньги: пока цена
+внутри — позиция участвует в обменах и получает комиссии, вышла за диапазон — перестаёт.
+Цены разбиты на шаги — **тики**, позиция в Raydium оформляется как **NFT**.
+
+Пул собран скриптами в [`raydium/`](raydium) на официальном SDK Raydium (по образцу
+`raydium-io/raydium-sdk-V2-demo`, раздел clmm):
+
+```bash
+cd raydium && npm install
+node create-tokens.mts    # второй токен tUSD + пополнение обоих токенов
+node create-pool.mts      # CLMM-пул с начальной ценой 1 VLT = 2 tUSD, комиссия 0.25%
+node open-position.mts    # позиция ±10% вокруг текущей цены (RANGE=10 AMOUNT=10000)
+node pool-info.mts        # цена, ликвидность, позиции
+```
+
+### Адреса в devnet
+
+| Что | Адрес |
+|---|---|
+| Токен vault — **VLT** | [Fmke…gUBx](https://explorer.solana.com/address/Fmke9hR8YLR127as4pPpPx4DLQgt1Pjh5rAqTWHzgUBx?cluster=devnet) (тот же, что принимает vault) |
+| Второй токен — **tUSD** | [4Nqn…RubZ4](https://explorer.solana.com/address/4NqnPuNnGra15G4RfjoahuTuTcNzN2C33wLobSjRubZ4?cluster=devnet) |
+| Программа Raydium CLMM (devnet) | [DRay…9pfH](https://explorer.solana.com/address/DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH?cluster=devnet) |
+| **Пул VLT / tUSD** | [7pSV…Aj8p](https://explorer.solana.com/address/7pSVsGQ3wvc6rLFgraye6Y6LqrFcr43f5wD3gCHiAj8p?cluster=devnet) |
+| Конфиг пула (комиссия 0.25%, шаг тиков 60) | [CD4a…Q1qu](https://explorer.solana.com/address/CD4aJtX11cqTCAc83nxSPkkh5JW2yjD6uwHeovjqQ1qu?cluster=devnet) |
+| **NFT позиции** | [GAia…EvMh9](https://explorer.solana.com/address/GAiadcKH2kUTvkvpL8iWWUYCiYQHw4ifDUr2GgfEvMh9?cluster=devnet) |
+| Создание пула | [транзакция](https://explorer.solana.com/tx/vHDGGNdL41fEyUCwdFbYtZvTQao28oBxUxU273pp5uzdq5QuCw9aPAQfumoBfqEB1DUHeaJeSbShw8joihmVCvT?cluster=devnet) |
+| Открытие позиции | [транзакция](https://explorer.solana.com/tx/5DkaVWpJVmuCxRQtDMC7YXk9QJEMSj5PYEXuzY4u6RKSqXAYMX3TDmq8jReU8rYhFmXPvcd1foJh5w3Ty7ECR4Lw?cluster=devnet) |
+
+Все адреса пула (vault-аккаунты, observation, bitmap) — в [`raydium.json`](raydium.json), они нужны для CPI на неделях 12–13.
+
+### Цена и диапазон
+
+Raydium упорядочивает токены пула по адресу, поэтому в пуле **токен A — tUSD, токен B — VLT**,
+и цена записана как «VLT за 1 tUSD».
+
+| | |
+|---|---|
+| Текущая цена | **0.5 VLT за 1 tUSD** = 2 tUSD за 1 VLT (тик −6932) |
+| Диапазон позиции | **0.4476 … 0.5488 VLT за tUSD** (тики −8040 … −6000) ≈ −10.5% / +9.8% |
+| В позиции | 10 000 tUSD + 5 920.4 VLT |
+
+**Почему такой диапазон.** Взял ±10% от текущей цены — правило из методички: отступить на
+величину обычного колебания цены. Уже ±1–2% дал бы больше комиссий с тех же денег, но цена
+быстро вышла бы за границы, и позицию пришлось бы постоянно переставлять. Широкий (±50% и больше)
+спокойнее, но почти не отличается от простого пула по доходу. ±10% — середина: обмены на неделях
+12–13 не выбьют цену из диапазона, а ликвидность сосредоточена рядом с ценой. Границы чуть
+несимметричны, потому что подгоняются к шагу тиков (60).
+
+### Найденная проблема SDK
+
+`raydium.clmm.getPoolInfoFromRpc` в SDK 0.2.74 падает на **новом пуле без ликвидности**
+(`Cannot convert undefined or null to object`): внутри `Object.values(tickData[poolId])`, а у пустого
+пула ещё нет tick-массивов. Из-за этого нельзя открыть первую позицию. Исправлено в
+[`raydium/common.mts`](raydium/common.mts) — для пулов без tick-массивов подставляются пустые данные.
+
+### Проверьте себя
+
+- **Чем концентрированная ликвидность отличается от простого пула?** В простом пуле деньги
+  распределены по всем ценам, и почти все лежат без дела. В CLMM провайдер сам выбирает диапазон,
+  и все его деньги работают только там — с той же суммы получается больше комиссий.
+- **Что происходит с позицией, когда цена выходит за её диапазон?** Она перестаёт участвовать в
+  обменах и зарабатывать. Вся позиция превращается в один токен: выше верхней границы — в токен B,
+  ниже нижней — в токен A. Доход вернётся, только если цена вернётся или диапазон переставят.
+- **Почему узкий диапазон зарабатывает больше, но требует больше внимания?** Та же сумма
+  распределена по меньшему числу тиков, поэтому на каждый обмен приходится большая доля комиссий.
+  Но цена чаще выходит из узкого диапазона, и его надо чаще переставлять (ребалансировка).
 
 ---
 
