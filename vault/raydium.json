@@ -14,5 +14,11 @@
   "positionTickUpper": "-6000",
   "openPositionTx": "5DkaVWpJVmuCxRQtDMC7YXk9QJEMSj5PYEXuzY4u6RKSqXAYMX3TDmq8jReU8rYhFmXPvcd1foJh5w3Ty7ECR4Lw",
   "swap_sell_Tx": "kPNxhqrxf8H7adM46fqdamFhkTh168zAUaSA8DRd8qgBbELbjRb9Ew95VzgexGTaEd8LQCqnaVaLv5GSVTy7CwB",
-  "swapFailTx": "eFg5GvLGqkBaonRPxuV7auBQGEP3jhLxUyqtAbK6Sduxu3kvyq8TYUaw3tgzBQuEdn9qvcNfi2xc2did2Te8P5T"
+  "swapFailTx": "eFg5GvLGqkBaonRPxuV7auBQGEP3jhLxUyqtAbK6Sduxu3kvyq8TYUaw3tgzBQuEdn9qvcNfi2xc2did2Te8P5T",
+  "vaultPositionNft": "5vYtNG4aUPzcUVHnDwjrA3N1vGo8tSyRoDojF2atTYgh",
+  "vaultOpenTx": "3RFc7WcafXW9Qs22wkfa69n5dSPLzrgd7aW5nwyfiDekAQBfGfaCiZYwoKwT84Rejy85TTiZZhvdF4f7yf2Lg9xA",
+  "vaultRange": "±5% от 1.893208",
+  "vaultCollectTx": "4RpAvCFP9S7TogYvhvG9UTFfJyieqyr5RCjWycTKZHu7gKai9ERngJp2Jt4eAQhCUSF2hxQGCJXhJnxg5JWQuP9q",
+  "rebalanceCloseTx": "3ZmFv7s1GnqxDCf8zgbk11kpNnYnnXvb67FQ6oaxRrp1ED45UVPvDfXf6d8mK5pF6peE579ZxtxqjUyfZUZwkPmW",
+  "vaultCloseTx": "2zBFfL6H7Xn1oxaT52AvFvHXu7cF5F3rzBR3TC1GuMfzko7QbbQZr8URpkpsHQ1nXAxRUpM27gwCJnjQ5ogecdwF"
 }

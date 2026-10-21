@@ -2,9 +2,12 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, TransferChecked};
 use anchor_spl::token_2022::Token2022;
-use raydium_amm_v3::cpi::accounts::SwapSingleV2;
+use raydium_amm_v3::cpi::accounts::{
+    ClosePosition as RaydiumClosePosition, DecreaseLiquidityV2, IncreaseLiquidityV2, OpenPositionWithToken22Nft,
+    SwapSingleV2,
+};
 use raydium_amm_v3::program::AmmV3;
-use raydium_amm_v3::states::PoolState;
+use raydium_amm_v3::states::{PersonalPositionState, PoolState};
 
 /// SPL Memo — Raydium требует его в swap_v2
 const MEMO_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
@@ -246,6 +249,129 @@ pub mod simple_vault {
         Ok(())
     }
 
+    /// Открыть позицию vault в пуле Raydium в диапазоне [tick_lower, tick_upper].
+    ///
+    /// Два CPI в одной инструкции:
+    ///   1. open_position_with_token22_nft с нулевой ликвидностью — платит за новые аккаунты админ
+    ///      (vault — PDA с данными и платить за создание аккаунтов не может), NFT позиции получает vault;
+    ///   2. increase_liquidity_v2 — подписывает vault PDA, токены уходят из хранилищ vault.
+    /// amount_0_max — точная сумма токена 0 пула, amount_1_max — максимум токена 1.
+    pub fn open_position<'info>(
+        ctx: Context<'_, '_, 'info, 'info, OpenVaultPosition<'info>>,
+        tick_lower: i32,
+        tick_upper: i32,
+        tick_array_lower_start: i32,
+        tick_array_upper_start: i32,
+        amount_0_max: u64,
+        amount_1_max: u64,
+    ) -> Result<()> {
+        let a = &ctx.accounts;
+        require_vault_storages(&a.vault_state, &a.strategy, a.token_account_0.key(), a.token_account_1.key())?;
+
+        let open = OpenPositionWithToken22Nft {
+            payer: a.admin.to_account_info(),
+            position_nft_owner: a.vault_state.to_account_info(),
+            position_nft_mint: a.position_nft_mint.to_account_info(),
+            position_nft_account: a.position_nft_account.to_account_info(),
+            pool_state: a.pool_state.to_account_info(),
+            protocol_position: a.protocol_position.to_account_info(),
+            tick_array_lower: a.tick_array_lower.to_account_info(),
+            tick_array_upper: a.tick_array_upper.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            token_account_0: a.token_account_0.to_account_info(),
+            token_account_1: a.token_account_1.to_account_info(),
+            token_vault_0: a.token_vault_0.to_account_info(),
+            token_vault_1: a.token_vault_1.to_account_info(),
+            rent: a.rent.to_account_info(),
+            system_program: a.system_program.to_account_info(),
+            token_program: a.token_program.to_account_info(),
+            associated_token_program: a.associated_token_program.to_account_info(),
+            token_program_2022: a.token_program_2022.to_account_info(),
+            vault_0_mint: a.vault_0_mint.to_account_info(),
+            vault_1_mint: a.vault_1_mint.to_account_info(),
+        };
+        raydium_amm_v3::cpi::open_position_with_token22_nft(
+            CpiContext::new(a.clmm_program.to_account_info(), open).with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+            tick_lower,
+            tick_upper,
+            tick_array_lower_start,
+            tick_array_upper_start,
+            0, // пустая позиция: ликвидность добавит vault следующим CPI
+            0,
+            0,
+            false,
+            None,
+        )?;
+
+        let token_mint = a.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint.as_ref(), &[a.vault_state.bump]]];
+        let increase = IncreaseLiquidityV2 {
+            nft_owner: a.vault_state.to_account_info(),
+            nft_account: a.position_nft_account.to_account_info(),
+            pool_state: a.pool_state.to_account_info(),
+            protocol_position: a.protocol_position.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            tick_array_lower: a.tick_array_lower.to_account_info(),
+            tick_array_upper: a.tick_array_upper.to_account_info(),
+            token_account_0: a.token_account_0.to_account_info(),
+            token_account_1: a.token_account_1.to_account_info(),
+            token_vault_0: a.token_vault_0.to_account_info(),
+            token_vault_1: a.token_vault_1.to_account_info(),
+            token_program: a.token_program.to_account_info(),
+            token_program_2022: a.token_program_2022.to_account_info(),
+            vault_0_mint: a.vault_0_mint.to_account_info(),
+            vault_1_mint: a.vault_1_mint.to_account_info(),
+        };
+        raydium_amm_v3::cpi::increase_liquidity_v2(
+            CpiContext::new_with_signer(a.clmm_program.to_account_info(), increase, signer_seeds)
+                .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+            0, // ликвидность посчитает Raydium из суммы токена 0
+            amount_0_max,
+            amount_1_max,
+            Some(true),
+        )?;
+        msg!("Position opened: ticks {}..{}, nft {}", tick_lower, tick_upper, a.position_nft_mint.key());
+        Ok(())
+    }
+
+    /// Забрать накопленные комиссии позиции в хранилища vault.
+    /// В Raydium это decrease_liquidity с нулевой ликвидностью: позиция не меняется, комиссии выплачиваются.
+    pub fn collect_fees<'info>(ctx: Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>) -> Result<()> {
+        decrease_position(&ctx, 0, 0, 0)?;
+        msg!("Fees collected for nft {}", ctx.accounts.position_nft_mint.key());
+        Ok(())
+    }
+
+    /// Закрыть позицию: вывести всю ликвидность (не меньше amount_0_min / amount_1_min — защита от
+    /// slippage), заодно забрать комиссии, затем закрыть позицию и сжечь NFT.
+    pub fn close_position<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
+        let liquidity = ctx.accounts.personal_position.liquidity;
+        decrease_position(&ctx, liquidity, amount_0_min, amount_1_min)?;
+
+        let a = &ctx.accounts;
+        let token_mint = a.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint.as_ref(), &[a.vault_state.bump]]];
+        let close = RaydiumClosePosition {
+            nft_owner: a.vault_state.to_account_info(),
+            position_nft_mint: a.position_nft_mint.to_account_info(),
+            position_nft_account: a.position_nft_account.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            system_program: a.system_program.to_account_info(),
+            token_program: a.token_program_2022.to_account_info(),
+        };
+        raydium_amm_v3::cpi::close_position(CpiContext::new_with_signer(
+            a.clmm_program.to_account_info(),
+            close,
+            signer_seeds,
+        ))?;
+        msg!("Position closed: liquidity {} returned to vault", liquidity);
+        Ok(())
+    }
+
     /// Поставить vault на паузу или снять с неё. Только админ.
     /// На паузе нельзя создавать новые карточки.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
@@ -253,6 +379,55 @@ pub mod simple_vault {
         msg!("Vault paused: {}", paused);
         Ok(())
     }
+}
+
+/// Токен-аккаунты позиции должны быть хранилищами vault (в любом порядке токенов пула):
+/// иначе админ мог бы направить токены или комиссии на свой кошелёк.
+fn require_vault_storages(vault: &VaultState, strategy: &Strategy, account_0: Pubkey, account_1: Pubkey) -> Result<()> {
+    let storages = [vault.vault_token_account, strategy.second_token_account];
+    require!(
+        storages.contains(&account_0) && storages.contains(&account_1) && account_0 != account_1,
+        VaultError::NotVaultStorage
+    );
+    Ok(())
+}
+
+/// CPI decrease_liquidity_v2 от имени vault: liquidity = 0 — только комиссии, иначе ещё и ликвидность.
+fn decrease_position<'info>(
+    ctx: &Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>,
+    liquidity: u128,
+    amount_0_min: u64,
+    amount_1_min: u64,
+) -> Result<()> {
+    let a = &ctx.accounts;
+    require_vault_storages(&a.vault_state, &a.strategy, a.token_account_0.key(), a.token_account_1.key())?;
+    let token_mint = a.vault_state.token_mint;
+    let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint.as_ref(), &[a.vault_state.bump]]];
+    let decrease = DecreaseLiquidityV2 {
+        nft_owner: a.vault_state.to_account_info(),
+        nft_account: a.position_nft_account.to_account_info(),
+        personal_position: a.personal_position.to_account_info(),
+        pool_state: a.pool_state.to_account_info(),
+        protocol_position: a.protocol_position.to_account_info(),
+        token_vault_0: a.token_vault_0.to_account_info(),
+        token_vault_1: a.token_vault_1.to_account_info(),
+        tick_array_lower: a.tick_array_lower.to_account_info(),
+        tick_array_upper: a.tick_array_upper.to_account_info(),
+        recipient_token_account_0: a.token_account_0.to_account_info(),
+        recipient_token_account_1: a.token_account_1.to_account_info(),
+        token_program: a.token_program.to_account_info(),
+        token_program_2022: a.token_program_2022.to_account_info(),
+        memo_program: a.memo_program.to_account_info(),
+        vault_0_mint: a.vault_0_mint.to_account_info(),
+        vault_1_mint: a.vault_1_mint.to_account_info(),
+    };
+    raydium_amm_v3::cpi::decrease_liquidity_v2(
+        CpiContext::new_with_signer(a.clmm_program.to_account_info(), decrease, signer_seeds)
+            .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+        liquidity,
+        amount_0_min,
+        amount_1_min,
+    )
 }
 
 /// a × b / c в u128, чтобы произведение не переполнилось; округление вниз — в пользу vault.
@@ -578,6 +753,165 @@ pub struct Swap<'info> {
 }
 
 #[derive(Accounts)]
+pub struct OpenVaultPosition<'info> {
+    #[account(
+        has_one = admin,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+
+    #[account(
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump = strategy.bump,
+        constraint = strategy.pool == pool_state.key() @ VaultError::WrongPool,
+    )]
+    pub strategy: Box<Account<'info, Strategy>>,
+
+    /// Платит за аккаунты позиции (rent), токены при этом отдаёт vault
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub clmm_program: Program<'info, AmmV3>,
+
+    /// Новый mint NFT позиции (одноразовый keypair)
+    #[account(mut)]
+    pub position_nft_mint: Signer<'info>,
+
+    /// CHECK: ATA NFT позиции для vault, создаёт Raydium
+    #[account(mut)]
+    pub position_nft_account: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// CHECK: PDA Raydium, проверяет Raydium
+    #[account(mut)]
+    pub protocol_position: UncheckedAccount<'info>,
+
+    /// CHECK: tick-массив нижней границы, проверяет/создаёт Raydium
+    #[account(mut)]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// CHECK: tick-массив верхней границы, проверяет/создаёт Raydium
+    #[account(mut)]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    /// CHECK: состояние позиции, создаёт Raydium
+    #[account(mut)]
+    pub personal_position: UncheckedAccount<'info>,
+
+    /// Хранилище vault для токена 0 пула
+    #[account(mut)]
+    pub token_account_0: Box<Account<'info, TokenAccount>>,
+
+    /// Хранилище vault для токена 1 пула
+    #[account(mut)]
+    pub token_account_1: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: vault-аккаунт пула для токена 0, проверяет Raydium
+    #[account(mut)]
+    pub token_vault_0: UncheckedAccount<'info>,
+
+    /// CHECK: vault-аккаунт пула для токена 1, проверяет Raydium
+    #[account(mut)]
+    pub token_vault_1: UncheckedAccount<'info>,
+
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program_2022: Program<'info, Token2022>,
+
+    /// CHECK: mint токена 0, проверяет Raydium
+    pub vault_0_mint: UncheckedAccount<'info>,
+
+    /// CHECK: mint токена 1, проверяет Raydium
+    pub vault_1_mint: UncheckedAccount<'info>,
+}
+
+/// Аккаунты для сбора комиссий и закрытия позиции vault.
+#[derive(Accounts)]
+pub struct ManageVaultPosition<'info> {
+    /// mut: при закрытии позиции Raydium возвращает rent её аккаунтов владельцу NFT — vault
+    #[account(
+        mut,
+        has_one = admin,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+
+    #[account(
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump = strategy.bump,
+        constraint = strategy.pool == pool_state.key() @ VaultError::WrongPool,
+    )]
+    pub strategy: Box<Account<'info, Strategy>>,
+
+    pub admin: Signer<'info>,
+
+    pub clmm_program: Program<'info, AmmV3>,
+
+    /// CHECK: mint NFT позиции, проверяет Raydium
+    #[account(mut)]
+    pub position_nft_mint: UncheckedAccount<'info>,
+
+    /// CHECK: токен-аккаунт NFT позиции (владелец — vault), проверяет Raydium
+    #[account(mut)]
+    pub position_nft_account: UncheckedAccount<'info>,
+
+    /// Позиция в пуле стратегии
+    #[account(mut, constraint = personal_position.pool_id == pool_state.key() @ VaultError::WrongPool)]
+    pub personal_position: Box<Account<'info, PersonalPositionState>>,
+
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// CHECK: PDA Raydium, проверяет Raydium
+    #[account(mut)]
+    pub protocol_position: UncheckedAccount<'info>,
+
+    /// CHECK: vault-аккаунт пула для токена 0, проверяет Raydium
+    #[account(mut)]
+    pub token_vault_0: UncheckedAccount<'info>,
+
+    /// CHECK: vault-аккаунт пула для токена 1, проверяет Raydium
+    #[account(mut)]
+    pub token_vault_1: UncheckedAccount<'info>,
+
+    /// CHECK: tick-массив нижней границы, проверяет Raydium
+    #[account(mut)]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// CHECK: tick-массив верхней границы, проверяет Raydium
+    #[account(mut)]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    /// Куда вернутся токен 0 и комиссии — хранилище vault
+    #[account(mut)]
+    pub token_account_0: Box<Account<'info, TokenAccount>>,
+
+    /// Куда вернутся токен 1 и комиссии — хранилище vault
+    #[account(mut)]
+    pub token_account_1: Box<Account<'info, TokenAccount>>,
+
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+
+    /// CHECK: SPL Memo, проверяется по адресу
+    #[account(address = MEMO_PROGRAM_ID)]
+    pub memo_program: UncheckedAccount<'info>,
+
+    /// CHECK: mint токена 0, проверяет Raydium
+    pub vault_0_mint: UncheckedAccount<'info>,
+
+    /// CHECK: mint токена 1, проверяет Raydium
+    pub vault_1_mint: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SetPaused<'info> {
     /// has_one = admin — подписать может только админ, записанный в vault.
     #[account(
@@ -659,4 +993,6 @@ pub enum VaultError {
     PoolMintMismatch,
     #[msg("Swaps are allowed only through the strategy pool")]
     WrongPool,
+    #[msg("Position token accounts must be the vault storages")]
+    NotVaultStorage,
 }

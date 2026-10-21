@@ -13,9 +13,10 @@ share-токены — квитанцию о своей доле. Основа �
 | 10 | Вывод через CPI: сжигание share-токенов, возврат токенов с подписью vault PDA |
 | 11 | Свой CLMM-пул Raydium в devnet (VLT / tUSD) и позиция в диапазоне ±10% |
 | 12 | Стратегия vault (второе хранилище + пул) и swap через CPI в Raydium с защитой от slippage |
+| 13 | Позиция vault в CLMM-пуле: открытие, сбор комиссий, закрытие, ребалансировка |
 
 Состояние проекта на конец каждой недели — по тегам: [week-08](https://github.com/LINESKL/solana-course/tree/week-08/vault),
-[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault), [week-11](https://github.com/LINESKL/solana-course/tree/week-11/vault), [week-12](https://github.com/LINESKL/solana-course/tree/week-12/vault).
+[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault), [week-11](https://github.com/LINESKL/solana-course/tree/week-11/vault), [week-12](https://github.com/LINESKL/solana-course/tree/week-12/vault), [week-13](https://github.com/LINESKL/solana-course/tree/week-13/vault).
 
 ---
 
@@ -334,6 +335,75 @@ Vault продал VLT в пул — VLT в пуле стало больше, и
   authority — VaultState (PDA). Админ только разрешает действие (`has_one = admin`), а отдать токены
   может лишь программа через seeds. Так админ не может вывести токены себе — только обменять их
   через заранее заданный пул.
+
+---
+
+## Неделя 13 — позиция vault в CLMM-пуле
+
+Теперь vault сам становится провайдером ликвидности: кладёт оба токена в выбранный диапазон пула,
+**NFT позиции принадлежит vault (PDA)**, комиссии с обменов достаются vault.
+
+| Инструкция | Кто | Что делает (CPI в Raydium) |
+|---|---|---|
+| `open_position(tick_lower, tick_upper, …, amount_0_max, amount_1_max)` | только админ | 1) `open_position_with_token22_nft` с нулевой ликвидностью — платит админ, NFT получает vault; 2) `increase_liquidity_v2` — подписывает vault PDA, токены уходят из хранилищ vault |
+| `collect_fees` | только админ | `decrease_liquidity_v2` с ликвидностью 0 — Raydium выплачивает накопленные комиссии в хранилища vault |
+| `close_position(amount_0_min, amount_1_min)` | только админ | `decrease_liquidity_v2` на всю ликвидность (с минимумами против slippage) + `close_position` — токены и комиссии возвращаются в vault, NFT сжигается |
+
+**Почему открытие в два шага.** В Raydium `open_position` один и тот же аккаунт платит за создание
+аккаунтов позиции и отдаёт токены. Vault — PDA **с данными**, а платить за создание аккаунтов в Solana
+может только аккаунт без данных. Поэтому позиция открывается пустой (Raydium это разрешает:
+«liquidity allows for further additions»), платит админ, а ликвидность добавляет сам vault.
+
+Защита: все действия только для админа (`has_one = admin`); токен-аккаунты позиции обязаны быть
+хранилищами vault (`NotVaultStorage`) — админ не может направить токены или комиссии себе; позиция должна
+быть из пула стратегии (`WrongPool`).
+
+```bash
+cd raydium
+node vault-position.mts open 5 100 80   # ±5% вокруг цены: 100 tUSD и не больше 80 VLT
+node vault-position.mts trade sell 40   # обмен с нашего кошелька (как сторонний трейдер)
+node vault-position.mts collect         # забрать комиссии
+node vault-position.mts rebalance 5     # закрыть и открыть заново вокруг новой цены
+node vault-position.mts close           # закрыть позиции
+node --test --test-force-exit position.test.mts   # 5 тестов на devnet
+```
+
+### Сценарий в devnet
+
+| Шаг | Что произошло | Транзакция |
+|---|---|---|
+| 1. Открыть позицию | цена 1.9958 tUSD/VLT, диапазон **±5%: 1.9002 … 2.1043** tUSD/VLT; vault отдал **100 tUSD + 53.93 VLT** | [open](https://explorer.solana.com/tx/3gPPhyiGHwBz2KJ17Fwtsi96tVpFHTokrudbwTQgzBcFjPyQTpDV4DjvcFjwrDUoyew1dNKvbWEQ8swqzbURay3r?cluster=devnet) |
+| 2. Обмены с другого кошелька | продажа 40 VLT и покупка VLT на 80 tUSD | [sell](https://explorer.solana.com/tx/335xjx1y63yQTBrjWddRdwippubRr9p6UiG8ku5jXwh9PaKMKE6nULKYkW49X93Jzsty7yK927Bx2xdPzMBRzv2n?cluster=devnet), [buy](https://explorer.solana.com/tx/sxyuNUAMaC5MUarkv2sWbhSyeCGcJQgtoBBDhFKf66UcrYdx4UmrzcG4YEYDpU1CFscLksEv6R89WhLx5DmJu6v?cluster=devnet) |
+| 3. Собрать комиссии | **+0.001549 VLT, +0.003098 tUSD** | [collect_fees](https://explorer.solana.com/tx/4RpAvCFP9S7TogYvhvG9UTFfJyieqyr5RCjWycTKZHu7gKai9ERngJp2Jt4eAQhCUSF2hxQGCJXhJnxg5JWQuP9q?cluster=devnet) |
+| 4. Цена ушла из диапазона | продажа 3000 VLT, цена **1.8932** < нижней границы 1.9002 — позиция перестала зарабатывать | [sell 3000](https://explorer.solana.com/tx/sNhdBJXd31fin4n35Z8xLvVyRPitLBi5JTxb5mPxYfU1VQwzsCDZFW6iAFoK1oKytBoPuwLTRpyMkJe4NrVXc6j?cluster=devnet) |
+| 5. Ребалансировка: закрыть | вернулось **105.39 VLT + 0 tUSD** | [close](https://explorer.solana.com/tx/3ZmFv7s1GnqxDCf8zgbk11kpNnYnnXvb67FQ6oaxRrp1ED45UVPvDfXf6d8mK5pF6peE579ZxtxqjUyfZUZwkPmW?cluster=devnet) |
+| 6. Ребалансировка: открыть заново | новый диапазон ±5% вокруг 1.8932: **1.8003 … 1.9936** | [open](https://explorer.solana.com/tx/3RFc7WcafXW9Qs22wkfa69n5dSPLzrgd7aW5nwyfiDekAQBfGfaCiZYwoKwT84Rejy85TTiZZhvdF4f7yf2Lg9xA?cluster=devnet) |
+| 7. Закрыть | вернулось **54.26 VLT + 100 tUSD** (цена не менялась) | [close](https://explorer.solana.com/tx/2zBFfL6H7Xn1oxaT52AvFvHXu7cF5F3rzBR3TC1GuMfzko7QbbQZr8URpkpsHQ1nXAxRUpM27gwCJnjQ5ogecdwF?cluster=devnet) |
+
+**Что показывает сценарий:**
+- **комиссии маленькие** (≈0.006 tUSD), потому что позиция vault (100 tUSD) крошечная рядом с ликвидностью
+  из недели 11 (10 000 tUSD): комиссия обмена делится между позициями пропорционально ликвидности;
+- **после выхода цены за нижнюю границу позиция целиком стала VLT** (105.39 VLT, 0 tUSD): пока цена падала,
+  трейдеры продавали в позицию VLT и забирали tUSD. По цене 1.8932 это ≈199.5 tUSD, а если бы vault просто
+  держал свои 100 tUSD + 53.93 VLT — ≈202.1 tUSD. Разница ≈1.3% — это **impermanent loss**, и именно
+  поэтому позицию нужно вовремя переставлять.
+
+**Упрощение учебной версии:** пока средства лежат в позиции, пользователи не могут их вывести — перед
+выводом админ закрывает позицию (`close`) и при необходимости меняет tUSD обратно в VLT
+(`vault-swap.mts buy`). Сейчас все позиции vault закрыты.
+
+### Проверьте себя
+
+- **Почему соотношение двух токенов в позиции зависит от того, где текущая цена внутри диапазона?**
+  Ликвидность в диапазоне — это «лестница» заявок: выше текущей цены позиция продаёт VLT, ниже — покупает.
+  Поэтому выше цены лежит VLT, ниже — tUSD. Цена у нижней границы — почти всё в VLT, у верхней — почти всё
+  в tUSD; посередине — примерно поровну по стоимости.
+- **Что будет с позицией, если цена уйдёт выше верхней границы?** Весь VLT будет продан, позиция станет
+  целиком tUSD и перестанет зарабатывать комиссии, пока цена не вернётся или позицию не переставят.
+  (В нашем сценарии цена ушла ниже нижней границы — и позиция стала целиком VLT.)
+- **Зачем нужна ребалансировка и кто её делает?** Чтобы позиция снова оказалась вокруг текущей цены и
+  зарабатывала. Делает администратор vault: закрывает старую позицию и открывает новую — то, что в
+  настоящих продуктах (Kamino, Meteora) делается автоматически.
 
 ---
 
