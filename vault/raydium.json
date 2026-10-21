@@ -12,5 +12,7 @@
   "positionNft": "GAiadcKH2kUTvkvpL8iWWUYCiYQHw4ifDUr2GgfEvMh9",
   "positionTickLower": "-8040",
   "positionTickUpper": "-6000",
-  "openPositionTx": "5DkaVWpJVmuCxRQtDMC7YXk9QJEMSj5PYEXuzY4u6RKSqXAYMX3TDmq8jReU8rYhFmXPvcd1foJh5w3Ty7ECR4Lw"
+  "openPositionTx": "5DkaVWpJVmuCxRQtDMC7YXk9QJEMSj5PYEXuzY4u6RKSqXAYMX3TDmq8jReU8rYhFmXPvcd1foJh5w3Ty7ECR4Lw",
+  "swap_sell_Tx": "kPNxhqrxf8H7adM46fqdamFhkTh168zAUaSA8DRd8qgBbELbjRb9Ew95VzgexGTaEd8LQCqnaVaLv5GSVTy7CwB",
+  "swapFailTx": "eFg5GvLGqkBaonRPxuV7auBQGEP3jhLxUyqtAbK6Sduxu3kvyq8TYUaw3tgzBQuEdn9qvcNfi2xc2did2Te8P5T"
 }

@@ -12,9 +12,10 @@ share-токены — квитанцию о своей доле. Основа �
 | 9 | Депозит: перевод токенов в хранилище, выпуск share-токенов по курсу, учёт в vault и карточке |
 | 10 | Вывод через CPI: сжигание share-токенов, возврат токенов с подписью vault PDA |
 | 11 | Свой CLMM-пул Raydium в devnet (VLT / tUSD) и позиция в диапазоне ±10% |
+| 12 | Стратегия vault (второе хранилище + пул) и swap через CPI в Raydium с защитой от slippage |
 
 Состояние проекта на конец каждой недели — по тегам: [week-08](https://github.com/LINESKL/solana-course/tree/week-08/vault),
-[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault), [week-11](https://github.com/LINESKL/solana-course/tree/week-11/vault).
+[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault), [week-11](https://github.com/LINESKL/solana-course/tree/week-11/vault), [week-12](https://github.com/LINESKL/solana-course/tree/week-12/vault).
 
 ---
 
@@ -262,6 +263,77 @@ Raydium упорядочивает токены пула по адресу, по
 - **Почему узкий диапазон зарабатывает больше, но требует больше внимания?** Та же сумма
   распределена по меньшему числу тиков, поэтому на каждый обмен приходится большая доля комиссий.
   Но цена чаще выходит из узкого диапазона, и его надо чаще переставлять (ребалансировка).
+
+---
+
+## Неделя 12 — swap через Raydium
+
+### Новый аккаунт: стратегия
+
+| Аккаунт | Seeds | Владелец | Что хранит |
+|---|---|---|---|
+| `Strategy` | `["strategy", vault_state]` | программа vault | пул Raydium, второй токен, адрес второго хранилища |
+| Второе хранилище | `["vault_tokens_2", vault_state]` | Token Program, authority — **VaultState (PDA)** | второй токен пула (tUSD) |
+
+Почему отдельный аккаунт, а не новые поля в `VaultState`: адрес vault вычисляется из mint токена,
+vault для VLT уже существует в devnet со старой структурой — добавить поля значило бы потерять его.
+Заодно `Strategy` фиксирует **один пул**: админ может обменивать токены vault только через него
+(`WrongPool` для любого другого).
+
+### Инструкции
+
+| Инструкция | Кто | Что делает |
+|---|---|---|
+| `init_strategy` | только админ | создаёт `Strategy` и второе хранилище; проверяет, что в пуле есть токен vault и второй токен (`PoolMintMismatch`) |
+| `swap(amount_in, minimum_amount_out, sell_vault_token)` | только админ | CPI `swap_v2` в Raydium CLMM: vault отдаёт один токен и получает другой |
+
+Как устроен `swap`:
+- вызывает Raydium через CPI (`raydium_amm_v3::cpi::swap_v2`, крейт Raydium на коммите `d4ec101`
+  — последняя версия на Anchor 0.31.1);
+- **подписывает программа от имени VaultState (PDA)** — токены принадлежат vault, у админа нет к ним доступа;
+- `minimum_amount_out` — минимум, который vault согласен получить: если пул отдаст меньше,
+  Raydium отменит весь обмен (`TooLittleOutputReceived`);
+- в `remaining_accounts` передаются bitmap-расширение пула и tick-массивы, по которым пройдёт обмен
+  (их подбирает клиент по котировке SDK).
+
+```bash
+cd raydium
+node vault-swap.mts sell 100        # 100 VLT -> tUSD, минимум = ожидаемое − 1%
+node vault-swap.mts buy 50          # 50 tUSD -> VLT
+node vault-swap.mts sell 50 fail    # минимум завышен вдвое — Raydium отклоняет
+node --test --test-force-exit swap.test.mts   # 6 тестов на devnet
+```
+
+### Результаты в devnet
+
+| Что | Ссылка |
+|---|---|
+| Strategy | [адрес](https://explorer.solana.com/address/22XTzzCnE7iGFt6BAj7MZwh2gCsZoi8o86JsrLocVybQ?cluster=devnet) |
+| **Успешный swap: 100 VLT → 199.29 tUSD** | [транзакция](https://explorer.solana.com/tx/kPNxhqrxf8H7adM46fqdamFhkTh168zAUaSA8DRd8qgBbELbjRb9Ew95VzgexGTaEd8LQCqnaVaLv5GSVTy7CwB?cluster=devnet) |
+| **Отклонённый из-за slippage** (ожидалось 99.51 tUSD, минимум 199.02) | [транзакция](https://explorer.solana.com/tx/eFg5GvLGqkBaonRPxuV7auBQGEP3jhLxUyqtAbK6Sduxu3kvyq8TYUaw3tgzBQuEdn9qvcNfi2xc2did2Te8P5T?cluster=devnet) — ошибка Raydium 6018 `TooLittleOutputReceived`, балансы vault не изменились |
+
+**Как изменилась цена пула после обмена 100 VLT:**
+
+| | Цена | В vault |
+|---|---|---|
+| До | 1.999728 tUSD за 1 VLT | 592.49 VLT + 14.95 tUSD |
+| После | **1.996101** tUSD за 1 VLT | 492.49 VLT + 214.24 tUSD |
+
+Vault продал VLT в пул — VLT в пуле стало больше, и он подешевел примерно на 0.18%.
+Получено 199.29 tUSD, а не 200: часть съела комиссия пула 0.25% и сдвиг цены по ходу обмена.
+
+### Проверьте себя
+
+- **Что такое slippage и как от него защищаются?** Разница между ожидаемой ценой и той, по которой
+  обмен реально прошёл: пока транзакция идёт в сеть, другие успевают поменять цену. Защита — минимум,
+  который согласен получить (`minimum_amount_out`); если пул отдаст меньше, обмен отменяется целиком.
+- **Почему цена сдвигается сильнее, если около текущей цены мало ликвидности?** Обмен «проходит» по
+  тикам, пока не наберётся нужная сумма. Если ликвидности рядом мало, придётся пройти больше тиков,
+  и цена уйдёт дальше.
+- **Почему обмен подписывает программа, а не администратор?** Токены лежат в хранилищах vault, их
+  authority — VaultState (PDA). Админ только разрешает действие (`has_one = admin`), а отдать токены
+  может лишь программа через seeds. Так админ не может вывести токены себе — только обменять их
+  через заранее заданный пул.
 
 ---
 

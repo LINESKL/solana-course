@@ -1,6 +1,13 @@
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, TransferChecked};
+use anchor_spl::token_2022::Token2022;
+use raydium_amm_v3::cpi::accounts::SwapSingleV2;
+use raydium_amm_v3::program::AmmV3;
+use raydium_amm_v3::states::PoolState;
+
+/// SPL Memo — Raydium требует его в swap_v2
+const MEMO_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 declare_id!("5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp");
 
@@ -162,6 +169,80 @@ pub mod simple_vault {
         vault.total_deposited = vault.total_deposited.saturating_sub(principal_out);
 
         msg!("Withdraw: {} shares -> {} tokens", shares, amount);
+        Ok(())
+    }
+
+    /// Подключить к vault стратегию: пул Raydium CLMM и второе хранилище для второго токена пула.
+    /// Только админ, один раз. Пул должен содержать токен vault и второй токен.
+    pub fn init_strategy(ctx: Context<InitStrategy>) -> Result<()> {
+        let pool = ctx.accounts.pool_state.load()?;
+        let vault_token = ctx.accounts.vault_state.token_mint;
+        let second = ctx.accounts.second_mint.key();
+        let pool_mints = [pool.token_mint_0, pool.token_mint_1];
+        require!(
+            pool_mints.contains(&vault_token) && pool_mints.contains(&second) && vault_token != second,
+            VaultError::PoolMintMismatch
+        );
+
+        let strategy = &mut ctx.accounts.strategy;
+        strategy.vault = ctx.accounts.vault_state.key();
+        strategy.pool = ctx.accounts.pool_state.key();
+        strategy.second_mint = second;
+        strategy.second_token_account = ctx.accounts.second_token_account.key();
+        strategy.bump = ctx.bumps.strategy;
+        msg!("Strategy: pool {}, second mint {}", strategy.pool, second);
+        Ok(())
+    }
+
+    /// Обмен через пул Raydium CLMM (CPI swap_v2). Только админ.
+    /// sell_vault_token = true: отдаём токен vault, получаем второй токен; false — наоборот.
+    /// minimum_amount_out — защита от slippage: если пул отдаст меньше, Raydium отменит обмен.
+    /// Токены отдаёт vault, поэтому подписывает программа от имени VaultState (PDA).
+    pub fn swap<'info>(
+        ctx: Context<'_, '_, 'info, 'info, Swap<'info>>,
+        amount_in: u64,
+        minimum_amount_out: u64,
+        sell_vault_token: bool,
+    ) -> Result<()> {
+        require!(amount_in > 0, VaultError::ZeroAmount);
+        let a = &ctx.accounts;
+        let (input, output) = if sell_vault_token {
+            (&a.vault_token_account, &a.second_token_account)
+        } else {
+            (&a.second_token_account, &a.vault_token_account)
+        };
+        let output_before = output.amount;
+
+        let token_mint = a.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint.as_ref(), &[a.vault_state.bump]]];
+        let cpi_accounts = SwapSingleV2 {
+            payer: a.vault_state.to_account_info(),
+            amm_config: a.amm_config.to_account_info(),
+            pool_state: a.pool_state.to_account_info(),
+            input_token_account: input.to_account_info(),
+            output_token_account: output.to_account_info(),
+            input_vault: a.input_pool_vault.to_account_info(),
+            output_vault: a.output_pool_vault.to_account_info(),
+            observation_state: a.observation_state.to_account_info(),
+            token_program: a.token_program.to_account_info(),
+            token_program_2022: a.token_program_2022.to_account_info(),
+            memo_program: a.memo_program.to_account_info(),
+            input_vault_mint: a.input_mint.to_account_info(),
+            output_vault_mint: a.output_mint.to_account_info(),
+        };
+        raydium_amm_v3::cpi::swap_v2(
+            CpiContext::new_with_signer(a.clmm_program.to_account_info(), cpi_accounts, signer_seeds)
+                // bitmap-расширение и tick-массивы пула, по которым пройдёт обмен
+                .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+            amount_in,
+            minimum_amount_out,
+            0,    // без ограничения цены, защищаемся minimum_amount_out
+            true, // amount_in — точная сумма на входе
+        )?;
+
+        let output = if sell_vault_token { &mut ctx.accounts.second_token_account } else { &mut ctx.accounts.vault_token_account };
+        output.reload()?;
+        msg!("Swap: {} in -> {} out", amount_in, output.amount - output_before);
         Ok(())
     }
 
@@ -394,6 +475,109 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitStrategy<'info> {
+    #[account(
+        has_one = admin,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    /// Strategy PDA — seeds: ["strategy", vault_state]. Одна на vault.
+    #[account(
+        init,
+        payer = admin,
+        space = Strategy::LEN,
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump,
+    )]
+    pub strategy: Account<'info, Strategy>,
+
+    pub second_mint: Account<'info, Mint>,
+
+    /// Второе хранилище — для второго токена пула. Authority — vault PDA.
+    #[account(
+        init,
+        payer = admin,
+        token::mint = second_mint,
+        token::authority = vault_state,
+        seeds = [b"vault_tokens_2", vault_state.key().as_ref()],
+        bump,
+    )]
+    pub second_token_account: Account<'info, TokenAccount>,
+
+    /// Пул Raydium CLMM; AccountLoader проверяет, что владелец — программа Raydium
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    #[account(
+        has_one = admin,
+        has_one = vault_token_account,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    /// Обменивать можно только через пул стратегии
+    #[account(
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump = strategy.bump,
+        has_one = second_token_account,
+        constraint = strategy.pool == pool_state.key() @ VaultError::WrongPool,
+    )]
+    pub strategy: Account<'info, Strategy>,
+
+    pub admin: Signer<'info>,
+
+    pub clmm_program: Program<'info, AmmV3>,
+
+    /// CHECK: проверяет Raydium (должен совпадать с pool_state.amm_config)
+    pub amm_config: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub second_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: vault-аккаунт пула для входного токена, проверяет Raydium
+    #[account(mut)]
+    pub input_pool_vault: UncheckedAccount<'info>,
+
+    /// CHECK: vault-аккаунт пула для выходного токена, проверяет Raydium
+    #[account(mut)]
+    pub output_pool_vault: UncheckedAccount<'info>,
+
+    /// CHECK: oracle-аккаунт пула, проверяет Raydium
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+
+    /// CHECK: SPL Memo, проверяется по адресу
+    #[account(address = MEMO_PROGRAM_ID)]
+    pub memo_program: UncheckedAccount<'info>,
+
+    /// CHECK: mint входного токена, проверяет Raydium
+    pub input_mint: UncheckedAccount<'info>,
+
+    /// CHECK: mint выходного токена, проверяет Raydium
+    pub output_mint: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SetPaused<'info> {
     /// has_one = admin — подписать может только админ, записанный в vault.
     #[account(
@@ -442,6 +626,21 @@ impl UserCard {
     pub const LEN: usize = 8 + 32 + 32 + 1 + 8 + 8;
 }
 
+/// Стратегия vault: через какой пул Raydium работать и где хранить второй токен пула.
+#[account]
+#[derive(Default)]
+pub struct Strategy {
+    pub vault: Pubkey,                // 32 — vault, к которому относится
+    pub pool: Pubkey,                 // 32 — пул Raydium CLMM
+    pub second_mint: Pubkey,          // 32 — второй токен пула
+    pub second_token_account: Pubkey, // 32 — второе хранилище (PDA)
+    pub bump: u8,                     // 1
+}
+
+impl Strategy {
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 1;
+}
+
 #[error_code]
 pub enum VaultError {
     #[msg("Vault is paused")]
@@ -456,4 +655,8 @@ pub enum VaultError {
     InsufficientShares,
     #[msg("Withdraw all funds before closing the card")]
     CardNotEmpty,
+    #[msg("Pool must contain the vault token and the second token")]
+    PoolMintMismatch,
+    #[msg("Swaps are allowed only through the strategy pool")]
+    WrongPool,
 }
