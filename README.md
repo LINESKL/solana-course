@@ -1,4 +1,4 @@
-# Solana: задания курса (недели 1–7)
+# Solana: задания курса
 
 Все программы задеплоены в **devnet**.
 
@@ -11,6 +11,8 @@
 | [5](week5) | Anchor Framework | `counter`: счётчик на Anchor, PDA на пользователя. Program ID `83VG5r3tT8ByFZe1PA6zz5MKDaBMmUh3wouVGhxGYnrw` |
 | [6](week6/profile) | Accounts, PDAs и архитектура | `profile`: on-chain профиль на двух PDA. Program ID `pHopUnPkowbYSm8PhfZupMGA1s3g8FBpBydCrHWmkST` |
 | [7](week7) | SPL Tokens и Token Extensions | Токен NURK на Token-2022 с метаданными. Mint `9yLnzSXcMayUDWB2VwboFbqaCB6Vx8cK5MeZy34PhWfb` |
+
+| [8–15](vault) | Сквозной проект Liquidity Vault | DeFi-vault на Anchor 0.31.1. Program ID `5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp` |
 
 В каждой папке есть README с командами сборки, тестов и запуска, а также отчёт по неделе (`.docx`).
 

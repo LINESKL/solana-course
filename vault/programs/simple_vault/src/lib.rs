@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
-declare_id!("EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu");
+declare_id!("5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp");
 
 #[program]
 pub mod simple_vault {
@@ -16,6 +16,7 @@ pub mod simple_vault {
         vault.vault_token_account = ctx.accounts.vault_token_account.key();
         vault.share_mint = ctx.accounts.share_mint.key();
         vault.bump = ctx.bumps.vault_state;
+        vault.paused = false;
 
         msg!("Vault initialized for mint: {}", vault.token_mint);
         Ok(())
@@ -24,12 +25,29 @@ pub mod simple_vault {
     /// Создать личную «карточку» пользователя в vault.
     /// У каждого пользователя ровно одна карточка (PDA от vault + user).
     pub fn create_user_card(ctx: Context<CreateUserCard>) -> Result<()> {
+        require!(!ctx.accounts.vault_state.paused, VaultError::VaultPaused);
+
         let card = &mut ctx.accounts.user_card;
         card.vault = ctx.accounts.vault_state.key();
         card.owner = ctx.accounts.user.key();
+        card.created_at = Clock::get()?.unix_timestamp;
         card.bump = ctx.bumps.user_card;
 
         msg!("User card created for: {}", card.owner);
+        Ok(())
+    }
+
+    /// Закрыть свою карточку: аккаунт удаляется, рента возвращается владельцу.
+    pub fn close_user_card(ctx: Context<CloseUserCard>) -> Result<()> {
+        msg!("User card closed for: {}", ctx.accounts.user.key());
+        Ok(())
+    }
+
+    /// Поставить vault на паузу или снять с неё. Только админ.
+    /// На паузе нельзя создавать новые карточки.
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        ctx.accounts.vault_state.paused = paused;
+        msg!("Vault paused: {}", paused);
         Ok(())
     }
 }
@@ -107,6 +125,42 @@ pub struct CreateUserCard<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct CloseUserCard<'info> {
+    #[account(
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    /// Seeds строятся из адреса подписанта, поэтому закрыть можно только свою карточку.
+    /// close = user — лампорты (рента) уходят владельцу.
+    #[account(
+        mut,
+        close = user,
+        seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
+        bump = user_card.bump,
+    )]
+    pub user_card: Account<'info, UserCard>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SetPaused<'info> {
+    /// has_one = admin — подписать может только админ, записанный в vault.
+    #[account(
+        mut,
+        has_one = admin,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    pub admin: Signer<'info>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,10 +173,11 @@ pub struct VaultState {
     pub vault_token_account: Pubkey, // 32 — PDA для токенов
     pub share_mint: Pubkey,          // 32 — mint для shares
     pub bump: u8,                    // 1
+    pub paused: bool,                // 1 — на паузе новые карточки не создаются
 }
 
 impl VaultState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 1 + 1;
 }
 
 /// Карточка пользователя в vault.
@@ -130,10 +185,17 @@ impl VaultState {
 #[derive(Default)]
 pub struct UserCard {
     pub vault: Pubkey, // 32 — к какому vault относится
-    pub owner: Pubkey, // 32 — владелец карточки
-    pub bump: u8,      // 1
+    pub owner: Pubkey,   // 32 — владелец карточки
+    pub bump: u8,        // 1
+    pub created_at: i64, // 8 — когда создана (unix time)
 }
 
 impl UserCard {
-    pub const LEN: usize = 8 + 32 + 32 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 1 + 8;
+}
+
+#[error_code]
+pub enum VaultError {
+    #[msg("Vault is paused")]
+    VaultPaused,
 }

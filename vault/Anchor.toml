@@ -2,14 +2,14 @@
 anchor_version = "0.31.1"
 
 [features]
-seeds = false
+resolution = true
 skip-lint = false
 
-[programs.localnet]
-simple_vault = "EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu"
-
 [programs.devnet]
-simple_vault = "EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu"
+simple_vault = "5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp"
+
+[programs.localnet]
+simple_vault = "5KDkgHuq5VRs3jJcVGkFqNZYNBAvymVFnn6tDdABEUwp"
 
 [registry]
 url = "https://api.apr.dev"
@@ -19,4 +19,10 @@ cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[test.validator]
+# порт 8000 на этой машине занят, поэтому свои порты
+bind_address = "127.0.0.1"
+gossip_port = 18000
+dynamic_port_range = "18001-18100"
