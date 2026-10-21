@@ -3,6 +3,7 @@
 //   node scripts/devnet.mts card   — создать свою карточку пользователя
 //   node scripts/devnet.mts mint 1000     — начислить себе тестовые токены vault (мы — mint authority)
 //   node scripts/devnet.mts deposit 100   — внести токены и получить share-токены
+//   node scripts/devnet.mts withdraw 400  — вернуть share-токены и забрать свою долю
 //   node scripts/devnet.mts show   — показать состояние vault и ссылки на Explorer
 // Адреса созданных аккаунтов сохраняются в devnet.json.
 import anchor from "@coral-xyz/anchor";
@@ -126,6 +127,28 @@ async function deposit() {
   await show();
 }
 
+async function withdraw() {
+  const state = load();
+  const accounts = requireVault(state);
+  const tokenMint = new PublicKey(state.tokenMint);
+  const sig = await program.methods
+    .withdraw(toUnits(process.argv[3]))
+    .accounts({
+      vaultState: accounts.vaultState,
+      userCard: accounts.userCard(payer.publicKey),
+      tokenMint,
+      vaultTokenAccount: accounts.vaultTokenAccount,
+      shareMint: accounts.shareMint,
+      userTokenAccount: getAssociatedTokenAddressSync(tokenMint, payer.publicKey),
+      userShareAccount: getAssociatedTokenAddressSync(accounts.shareMint, payer.publicKey),
+      user: payer.publicKey,
+    })
+    .rpc();
+  save({ ...state, withdrawTx: sig });
+  console.log(`withdraw ${process.argv[3]} shares:`, explorer("tx", sig));
+  await show();
+}
+
 async function show() {
   const state = load();
   const accounts = requireVault(state);
@@ -155,10 +178,10 @@ async function show() {
   }
 }
 
-const commands: Record<string, () => Promise<void>> = { init, card, mint, deposit, show };
+const commands: Record<string, () => Promise<void>> = { init, card, mint, deposit, withdraw, show };
 const command = commands[process.argv[2] ?? "show"];
 if (!command) {
-  console.error("usage: node scripts/devnet.mts <init|card|mint N|deposit N|show>");
+  console.error("usage: node scripts/devnet.mts <init|card|mint N|deposit N|withdraw N|show>");
   process.exit(1);
 }
 await command();

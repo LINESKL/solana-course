@@ -10,6 +10,10 @@ share-токены — квитанцию о своей доле. Основа �
 |---|---|
 | 8 | Каркас: vault, share-токен, хранилище, карточка пользователя. Пауза vault, закрытие карточки, время создания |
 | 9 | Депозит: перевод токенов в хранилище, выпуск share-токенов по курсу, учёт в vault и карточке |
+| 10 | Вывод через CPI: сжигание share-токенов, возврат токенов с подписью vault PDA |
+
+Состояние проекта на конец каждой недели — по тегам: [week-08](https://github.com/LINESKL/solana-course/tree/week-08/vault),
+[week-09](https://github.com/LINESKL/solana-course/tree/week-09/vault), [week-10](https://github.com/LINESKL/solana-course/tree/week-10/vault).
 
 ---
 
@@ -138,6 +142,55 @@ simple_vault · Deposit
 
 ---
 
+## Неделя 10 — CPI и вывод
+
+**CPI (Cross-Program Invocation)** — вызов одной программы из другой. Сама программа vault токены
+двигать не умеет, это делает Token Program, поэтому vault вызывает её. Бывает два вида подписи:
+
+| Что двигаем | Кто подписывает | Как в коде |
+|---|---|---|
+| Токены пользователя (депозит, сжигание shares) | пользователь — его подпись передаётся дальше по цепочке | `CpiContext::new(...)` |
+| Токены vault (выпуск shares, вывод из хранилища) | программа от имени VaultState (PDA) | `CpiContext::new_with_signer(..., seeds)` |
+
+`withdraw(shares)`:
+
+1. проверяет, что shares > 0 и у пользователя их достаточно (`ZeroAmount`, `InsufficientShares`);
+2. считает долю: `amount = shares × всего_токенов_в_vault / всего_shares`;
+3. **CPI `burn`** — сжигает share-токены пользователя (подпись пользователя);
+4. **CPI `transfer_checked`** — переводит токены из хранилища пользователю (подпись vault PDA через seeds `["vault", token_mint, bump]`);
+5. уменьшает `deposited` в карточке и `total_deposited` в vault пропорционально выведенной доле.
+
+Вывод разрешён и на паузе: выйти из vault пользователь может всегда. Карточку с внесёнными
+средствами закрыть нельзя (`CardNotEmpty`).
+
+### Вывод в devnet
+
+[Транзакция вывода 400 share-токенов](https://explorer.solana.com/tx/67XtgY5iFjfVsa3GR2fTDdEPEEJm9rBScgYtgQBH83QCqTaifv4jsiLehatWWHb3rphFHedUfAfVvuC9hSC3WVQP?cluster=devnet):
+в vault было 1000 токенов и 1000 shares, пользователь вернул 400 shares и получил 400 токенов.
+
+**CPI-вызовы в этой транзакции** (в Explorer — блок *Inner Instructions*):
+
+```
+simple_vault · Withdraw                                  invoke [1]
+├─ Token Program · burn            400 shares            invoke [2]  подпись пользователя
+└─ Token Program · transferChecked 400 токенов → user    invoke [2]  подпись vault PDA
+```
+
+`invoke [2]` в логах — это вызов второго уровня, то есть CPI из нашей программы.
+
+### Проверьте себя
+
+- **Что такое CPI и зачем он нужен?** Вызов одной программы из другой. Не нужно писать всё с нуля:
+  токены двигает Token Program, а дальше vault так же будет вызывать биржу Raydium.
+- **Когда подписывает пользователь, а когда программа?** Пользователь — когда двигаются его токены
+  (перевод в vault, сжигание его shares). Программа от имени PDA — когда двигаются токены vault
+  (выпуск shares, выдача токенов из хранилища).
+- **Почему администратор не может просто забрать токены из vault своей подписью?** Authority хранилища —
+  VaultState (PDA), а не админ. Подписать за PDA может только программа, а в программе нет
+  инструкции, которая отдала бы токены админу.
+
+---
+
 ## Запуск
 
 Нужны: Rust, Solana CLI, **Anchor CLI 0.31.1**, Node.js 18+.
@@ -160,6 +213,7 @@ node scripts/devnet.mts init    # тестовый токен + vault
 node scripts/devnet.mts card    # своя карточка
 node scripts/devnet.mts mint 5000      # начислить себе тестовые токены
 node scripts/devnet.mts deposit 1000   # депозит
+node scripts/devnet.mts withdraw 400   # вывод (сколько share-токенов вернуть)
 node scripts/devnet.mts show    # состояние и ссылки на Explorer
 ```
 

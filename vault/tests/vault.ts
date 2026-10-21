@@ -316,4 +316,92 @@ describe("simple_vault", () => {
     await expectError(deposit(userA, tokens(1)), "VaultPaused");
     await setPaused(false);
   });
+
+  // ── Неделя 10: вывод через CPI ──────────────────────────────────────────
+
+  const withdraw = (user: Keypair, shares: BN, userTokenAccount = getAssociatedTokenAddressSync(tokenMint, user.publicKey)) =>
+    program.methods
+      .withdraw(shares)
+      .accounts({
+        vaultState: vaultStatePDA,
+        userCard: cardPda(user.publicKey),
+        tokenMint,
+        vaultTokenAccount: vaultTokenAccountPDA,
+        shareMint: shareMintPDA,
+        userTokenAccount,
+        userShareAccount: getAssociatedTokenAddressSync(shareMintPDA, user.publicKey),
+        user: user.publicKey,
+      } as any)
+      .signers([user])
+      .rpc();
+
+  const tokenBalance = async (user: PublicKey) =>
+    Number((await getAccount(provider.connection, getAssociatedTokenAddressSync(tokenMint, user))).amount) / UNIT;
+  const shareSupply = async () => Number((await getMint(provider.connection, shareMintPDA)).supply) / UNIT;
+
+  it("вывод: share-токены сжигаются, токены возвращаются по курсу", async () => {
+    // сейчас: в vault 1221 токен, выпущено 1110 shares, у userB 100 shares (внёс 110)
+    const vaultBefore = await vaultBalance();
+    const supplyBefore = await shareSupply();
+    const walletBefore = await tokenBalance(userB.publicKey);
+
+    await withdraw(userB, tokens(100));
+
+    // 100 / 1110 × 1221 = 110 токенов: userB получил свои 110 обратно
+    const expected = Math.floor((100 * UNIT * vaultBefore * UNIT) / (supplyBefore * UNIT)) / UNIT;
+    assert.equal(expected, 110);
+    assert.equal(await tokenBalance(userB.publicKey), walletBefore + expected);
+    assert.equal(await shareBalance(userB.publicKey), 0);
+    assert.equal(await shareSupply(), supplyBefore - 100);
+    assert.equal(await vaultBalance(), vaultBefore - expected);
+
+    const card = await program.account.userCard.fetch(cardPda(userB.publicKey));
+    assert.equal(card.deposited.toNumber(), 0);
+  });
+
+  it("частичный вывод уменьшает внесённую сумму пропорционально", async () => {
+    // у userA 1010 shares и внесено 1011 токенов; выводим половину shares
+    const cardBefore = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    const vaultBefore = await program.account.vaultState.fetch(vaultStatePDA);
+
+    await withdraw(userA, tokens(505));
+
+    assert.equal(await shareBalance(userA.publicKey), 505);
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    const principalOut = Math.floor((cardBefore.deposited.toNumber() * 505) / 1010);
+    assert.equal(card.deposited.toNumber(), cardBefore.deposited.toNumber() - principalOut);
+    const vault = await program.account.vaultState.fetch(vaultStatePDA);
+    assert.equal(vault.totalDeposited.toNumber(), vaultBefore.totalDeposited.toNumber() - principalOut);
+  });
+
+  it("вывод нуля запрещён", async () => {
+    await expectError(withdraw(userA, new BN(0)), "ZeroAmount");
+  });
+
+  it("нельзя вывести больше share-токенов, чем есть", async () => {
+    await expectError(withdraw(userA, tokens(506)), "InsufficientShares");
+  });
+
+  it("нельзя вывести на чужой токен-аккаунт", async () => {
+    const othersAccount = getAssociatedTokenAddressSync(tokenMint, userB.publicKey);
+    await expectError(withdraw(userA, tokens(1), othersAccount), "ConstraintTokenOwner");
+  });
+
+  it("на паузе вывод разрешён: выйти из vault можно всегда", async () => {
+    await setPaused(true);
+    await withdraw(userA, tokens(5));
+    await setPaused(false);
+    assert.equal(await shareBalance(userA.publicKey), 500);
+  });
+
+  it("карточку с внесёнными средствами закрыть нельзя", async () => {
+    await expectError(closeCard(userA), "CardNotEmpty");
+  });
+
+  it("после полного вывода карточку можно закрыть", async () => {
+    await withdraw(userA, tokens(500));
+    assert.equal((await program.account.userCard.fetch(cardPda(userA.publicKey))).deposited.toNumber(), 0);
+    await closeCard(userA);
+    assert.isNull(await provider.connection.getAccountInfo(cardPda(userA.publicKey)));
+  });
 });
